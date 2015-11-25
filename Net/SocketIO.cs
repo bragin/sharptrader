@@ -52,7 +52,7 @@ namespace WebSockets.Net
 
 	//=============================================================================================
 
-	// I use events now 
+	// I use events now
 	//		as Action<...> - no need to create some EventArgs(Windows.Forms) or RoutedEventsArgs(WPF)
 	// usually u need OnString & OnJson events only, not all
 

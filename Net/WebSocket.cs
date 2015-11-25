@@ -60,6 +60,7 @@ namespace WebSockets.Net
 		// all methods can be invoked from working threads
 
 		void OnString( WebSocket sender, string data );
+
 		void OnBinary( WebSocket sender, byte[] data );
 
 		void OnPong( WebSocket sender, byte[] data );
@@ -114,14 +115,26 @@ namespace WebSockets.Net
         Pong = 0xa
     }
 
-	// no supports framing. all frames must be FIN.
-	// no supports long messages: >= 64K
+	public enum WebSocketState : ushort
+	{
+		Connecting = 0,
+		Open = 1,
+		Closing = 2,
+		Closed = 3
+	}
+
+	// no support for framing. all frames must be FIN.
+	// no support for long messages: >= 64K
 	public class WebSocket : IDisposable
 	{
 		// not need attribute [beforeFieldInit]
 		static WebSocket() { }
 
 		readonly Encoding _enc;
+		WebSocketState _state;
+
+		// Sync objects
+		object _forState;
 
 		public WebSocket() : this( Encoding.UTF8 ) { }
 
@@ -136,6 +149,9 @@ namespace WebSockets.Net
 			HttpHeader = "GET {0} HTTP/1.1";
 
 			prepareHeaders();
+
+			_forState = new object();
+			_state = WebSocketState.Closed;
 		}
 
 		// props
@@ -149,6 +165,14 @@ namespace WebSockets.Net
 			{
 				Helper.CheckArg( string.IsNullOrEmpty( value ), "Version" );
 				_version = value;
+			}
+		}
+
+		public bool IsOpen
+		{
+			get
+			{
+				return (_state == WebSocketState.Connecting || _state == WebSocketState.Open);
 			}
 		}
 
@@ -174,7 +198,6 @@ namespace WebSockets.Net
 		}
 
 		// masking client frames
-		// MtGox not supports masking (at 2011.12.27), so default is false
 		volatile bool _masking = false;
 		public bool IsMasking
 		{
@@ -203,33 +226,48 @@ namespace WebSockets.Net
 		// Sec-WebSocket-Version: 8, 7
 		public WebHeaderCollection ResponseHeaders { get; private set; }
 
+		string _url;
 		public void Open( string url )
 		{
-			Close();
+			if (IsOpen)
+			{
+				Close();
+				Helper.Log("FIXME: Wait for the connection to close");
+			}
+
+			_url = url;
+
 			try
 			{
+				_state = WebSocketState.Connecting;
 				makeHandshake( url );
-				_isShuted = false;
 			}
 			catch (Exception err)
 			{
 				Helper.Log( "ERROR: " + err );
+				_state = WebSocketState.Closed;
 				throw;
 			}
 		}
 
-		public Stream Detach()
-		{
-			_isShuted = true;
-			return Interlocked.Exchange( ref _stream, null );
-		}
-
 		public void Close()
 		{
-			_isShuted = true;
-			//RequestHeaders.Clear();
+			if (!IsOpen) return;
+
+			// Change state to Closing so that no other messages come through
+			_state = WebSocketState.Closing;
+
+			// Send Close control frame
+			SendClose();
+
+			// TODO: Cleanup
+		}
+
+		public void Cleanup()
+		{
 			ResponseHeaders.Clear();
 			Stream = null;
+			_state = WebSocketState.Closed;
 		}
 
 		public void Ping( byte[] data = null )
@@ -238,8 +276,7 @@ namespace WebSockets.Net
 			send( Opcode.Ping, data, true );
 		}
 
-		volatile bool _isShuted = true;
-		public void Shutdown( ShutdownCode? code = null, byte[] data = null )
+		public void SendClose( ShutdownCode? code = null, byte[] data = null )
 		{
 			Helper.CheckArg( data == null || data.Length < 124, "Shutdown.data.Length must be less than 124" );
 			Helper.CheckArg( code.HasValue || data == null, "If data is not null than ShutdownCode must be set" );
@@ -266,10 +303,10 @@ namespace WebSockets.Net
 			send( str, Encoding.ASCII, str.Length, flush );
 		}
 
-        public void SendUTF8(string str, bool flush = true)
-        {
-            send(str, Encoding.UTF8, str.Length, flush);
-        }
+		public void SendUTF8(string str, bool flush = true)
+		{
+			send(str, Encoding.UTF8, str.Length, flush);
+		}
 
 		public void Send( string str, bool flush = true )
 		{
@@ -351,6 +388,9 @@ namespace WebSockets.Net
 			var shash = Convert.ToBase64String( bsec );
 			if (whs[ sSecAccept ] != shash)
 				throw new FormatException( "Sec-WebSocket-Accept not equals to SHA1-hash" );
+
+			// The connection is now in the OPEN state
+			_state = WebSocketState.Open;
 
 			Stream = stream;
 			beginRecv( stream );
@@ -434,7 +474,7 @@ namespace WebSockets.Net
 
 		private void send( Opcode payload, byte[] data, bool flush )
 		{
-			Helper.CheckOperation( !_isShuted, "Stream is shutdowned" );
+			Helper.CheckOperation( !IsOpen, "Stream is shutdowned" );
 
 			var len = data != null ? data.Length : 0;
 			var buf = _sbuf;
@@ -446,7 +486,6 @@ namespace WebSockets.Net
 					Array.Copy( data, 0, buf, ofs, len );
 					maskFrame( len, ofs );
 				}
-				_isShuted = _isShuted || (payload == Opcode.Close);
 				send( buf, len + ofs, flush );
 			}
 
@@ -471,6 +510,8 @@ namespace WebSockets.Net
 				// if not closed
 				if (_stream == stream)
 					onError( "send", err );
+
+				Cleanup();
 			}
 		}
 		#endregion recv & send
@@ -717,13 +758,11 @@ namespace WebSockets.Net
                             onBinary(data);
                             break;
                         case Opcode.Ping: // ping
-                            if (!_isShuted)
-                                // send Pong
-                                send(Opcode.Pong, data, true);
+                            // reply with a Pong
+                            if (IsOpen) send(Opcode.Pong, data, true);
                             break;
                         case Opcode.Pong: // pong
-                            if (!_isShuted)
-                                onPong(data);
+                            if (IsOpen) onPong(data);
                             break;
                         case Opcode.Close: // close(protocol), here - shutdown
                             {
@@ -743,14 +782,14 @@ namespace WebSockets.Net
                                     }
                                 }
                                 // if this is not echos of our Shutdown...
-                                if (!_isShuted)
+                                if (_state != WebSocketState.Closing)
                                 {
                                     onShutdown(code, data);
                                     // send feedback: data = null
-                                    Shutdown(code);
+                                    SendClose(code);
                                 }
                                 // and close connection
-                                Close();
+                                Cleanup();
                             }
                             break;
                         default:
@@ -766,7 +805,7 @@ namespace WebSockets.Net
                 }
 
                 // Read next messages header
-                if (!_isShuted && _stream == stream)
+                if (IsOpen && _stream == stream)
                     beginRecv(stream);
             }
             catch (Exception err)
@@ -776,7 +815,7 @@ namespace WebSockets.Net
                     onError("recv", err);
 
                 // we cant read data after errors: invalid buffer pointers and etc
-                //Close();
+                Cleanup();
                 // !!! race-condition if somebody Open another connection
             }
         }

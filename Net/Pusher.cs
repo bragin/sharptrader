@@ -43,7 +43,7 @@ namespace WebSockets.Net
 		// not need attribute [beforeFieldInit]
 		static Pusher() { }
 
-        public Pusher() { }
+		public Pusher() { }
 
 		volatile WebSocket _sock; // = null
 		public WebSocket WebSocket { get { return _sock; } }
@@ -90,7 +90,7 @@ namespace WebSockets.Net
 
             //_sock.SendUTF8(JsonConvert.SerializeObject(pev));
             //string str = "{\"event\":\"pusher:subscribe\",\"data\":\"{\\\"channel\\\":\\\"order_book\\\"}\"}";
-            string str = "{\"event\":\"pusher:subscribe\",\"data\":{\"channel\":\"order_book\"}}";
+            string str = String.Format("{{\"event\":\"pusher:subscribe\",\"data\":{{\"channel\":\"{0}\"}}}}", ch);
             _sock.Send(str);
         }
 
@@ -113,7 +113,7 @@ namespace WebSockets.Net
 
 		public event Action<string> OnDisconnect; // endPoint
         public event Action<PusherConnectionEstablished> OnConnect; // data
-		public event Action<string, int?, string> OnEvent; // json-event, message-id, endPoint
+		public event Action<string, string> OnEvent; // json-event, message-id, endPoint
 		public event Action<int, string> OnAck; // message-id, data
 		public event Action<string, string, string> OnError; // endPoint, reason + advise
 
@@ -259,16 +259,10 @@ namespace WebSockets.Net
                         }
                         break;
 
-                    case "data":
-                        {
-                            //msgStr	"{\"event\":\"data\",\"data\":\"{}\",\"channel\":\"order_book\"}"	string
-                            // Ignore for now
-                        }
-                        break;
-
-
 					default:
-						Helper.RaiseUnexpected( new NotSupportedException( "Unknown socket.io packet " + eventWrap.@event ) );
+						if (OnEvent != null)
+                            OnEvent(eventWrap.@event, eventWrap.data);
+						//Helper.RaiseUnexpected( new NotSupportedException( "Unknown socket.io packet " + eventWrap.@event ) );
 						break;
 				}
 			}
